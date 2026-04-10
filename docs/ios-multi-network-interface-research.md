@@ -21,6 +21,8 @@
 | **方案 D：Happy Eyeballs / 竞速连接** | Network.framework | iOS 12 | ❌ | 高 | 对延迟极度敏感的场景 |
 | **方案 E：QUIC 连接迁移** | Network.framework | iOS 15 | ✅ 需要 | 中 | 新项目、可控服务端 |
 
+| **方案 F：libcurl + CURLOPT_INTERFACE** | libcurl (C) | iOS 9+ | ❌ | 中 | 已有 libcurl 基础设施、跨平台项目 |
+
 ---
 
 ## 三、各方案详细分析
@@ -625,6 +627,974 @@ func createQUICConnection(host: String, port: UInt16) -> NWConnection? {
 
 ---
 
+### 方案 F：libcurl + CURLOPT_INTERFACE 指定网卡（重点方案）
+
+#### 原理
+
+libcurl 提供 `CURLOPT_INTERFACE` 选项，可以将出站连接绑定到指定的网络接口名或 IP 地址。在 iOS 上，WiFi 接口名为 `en0`，蜂窝接口名为 `pdp_ip0`（可能还有 `pdp_ip1` 等）。通过 `getifaddrs()` 枚举当前可用接口和对应 IP 地址，然后用 `CURLOPT_INTERFACE` 将 curl 请求绑定到目标接口，实现完整的 HTTP 请求（含 Header、Cookie、重定向、TLS）且指定网卡。
+
+#### iOS 上的网络接口名称
+
+| 接口名 | 含义 |
+|--------|------|
+| `en0` | WiFi |
+| `pdp_ip0` | 蜂窝数据（主卡，Packet Data Protocol） |
+| `pdp_ip1` / `pdp_ip2` / `pdp_ip3` | 蜂窝数据（其他通道 / 副卡） |
+| `lo0` | 本地回环 |
+| `awdl0` | Apple Wireless Direct Link |
+| `ap1` | 热点 Access Point |
+
+> **注意**：Apple 官方声明 BSD 接口名不是 API，不保证永远不变。但实际上 `en0` (WiFi) 和 `pdp_ip0` (蜂窝) 在所有 iOS 版本中一直稳定使用。
+
+#### 集成 libcurl 到 iOS 项目
+
+**方式 1：预编译 XCFramework（推荐）**
+
+使用 [curl-apple](https://github.com/nicerobot/curl-apple) 或 [libcurl-ios-prebuilt](https://github.com/nicerobot/libcurl-ios-prebuilt-and-buildscripts) 提供的构建脚本：
+
+```bash
+# 编译 libcurl 静态库 for iOS (arm64) + 模拟器 (arm64 + x86_64)
+# 支持选项：Secure Transport / OpenSSL、HTTP/2、zlib 等
+./build.sh --target=ios --tls=secure-transport --enable-http2
+
+# 输出 libcurl.xcframework，拖入 Xcode 即可
+```
+
+**方式 2：CocoaPods**
+
+```ruby
+# Podfile
+pod 'SwiftyCurl', '~> 0.5'
+```
+
+**方式 3：手动编译**
+
+```bash
+# 交叉编译 for iOS arm64
+export CC=$(xcrun -sdk iphoneos -find clang)
+export CFLAGS="-arch arm64 -isysroot $(xcrun -sdk iphoneos --show-sdk-path) -miphoneos-version-min=13.0"
+./configure --host=arm-apple-darwin --with-secure-transport --enable-static --disable-shared
+make
+```
+
+#### 完整实现代码
+
+##### 1. 网络接口枚举工具（C / Objective-C）
+
+```c
+// CURLInterfaceHelper.h
+
+#import <Foundation/Foundation.h>
+
+typedef NS_ENUM(NSInteger, MPNetworkType) {
+    MPNetworkTypeWiFi,
+    MPNetworkTypeCellular,
+    MPNetworkTypeAny
+};
+
+@interface MPNetworkInterface : NSObject
+@property (nonatomic, copy) NSString *name;       // e.g. "en0", "pdp_ip0"
+@property (nonatomic, copy) NSString *ipv4Address;
+@property (nonatomic, copy, nullable) NSString *ipv6Address;
+@property (nonatomic, assign) MPNetworkType type;
+@property (nonatomic, assign, getter=isUp) BOOL up;
+@end
+
+@interface MPInterfaceDetector : NSObject
++ (NSArray<MPNetworkInterface *> *)availableInterfaces;
++ (nullable MPNetworkInterface *)wifiInterface;
++ (nullable MPNetworkInterface *)cellularInterface;
++ (nullable NSString *)interfaceNameForType:(MPNetworkType)type;
++ (nullable NSString *)ipAddressForType:(MPNetworkType)type;
+@end
+```
+
+```objc
+// CURLInterfaceHelper.m
+
+#import "CURLInterfaceHelper.h"
+#include <ifaddrs.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+
+@implementation MPNetworkInterface
+@end
+
+@implementation MPInterfaceDetector
+
++ (NSArray<MPNetworkInterface *> *)availableInterfaces {
+    NSMutableArray<MPNetworkInterface *> *result = [NSMutableArray array];
+    NSMutableDictionary<NSString *, MPNetworkInterface *> *map = [NSMutableDictionary dictionary];
+    
+    struct ifaddrs *interfaces = NULL;
+    if (getifaddrs(&interfaces) != 0) {
+        return result;
+    }
+    
+    for (struct ifaddrs *addr = interfaces; addr != NULL; addr = addr->ifa_next) {
+        if (addr->ifa_addr == NULL) continue;
+        
+        NSString *name = [NSString stringWithUTF8String:addr->ifa_name];
+        sa_family_t family = addr->ifa_addr->sa_family;
+        
+        if (family != AF_INET && family != AF_INET6) continue;
+        
+        MPNetworkInterface *iface = map[name];
+        if (!iface) {
+            iface = [[MPNetworkInterface alloc] init];
+            iface.name = name;
+            iface.up = (addr->ifa_flags & IFF_UP) && (addr->ifa_flags & IFF_RUNNING);
+            
+            if ([name isEqualToString:@"en0"]) {
+                iface.type = MPNetworkTypeWiFi;
+            } else if ([name hasPrefix:@"pdp_ip"]) {
+                iface.type = MPNetworkTypeCellular;
+            } else {
+                iface.type = MPNetworkTypeAny;
+            }
+            
+            map[name] = iface;
+            [result addObject:iface];
+        }
+        
+        char addrBuf[INET6_ADDRSTRLEN];
+        if (family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)addr->ifa_addr;
+            inet_ntop(AF_INET, &sin->sin_addr, addrBuf, sizeof(addrBuf));
+            iface.ipv4Address = [NSString stringWithUTF8String:addrBuf];
+        } else if (family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)addr->ifa_addr;
+            inet_ntop(AF_INET6, &sin6->sin6_addr, addrBuf, sizeof(addrBuf));
+            iface.ipv6Address = [NSString stringWithUTF8String:addrBuf];
+        }
+    }
+    
+    freeifaddrs(interfaces);
+    return result;
+}
+
++ (nullable MPNetworkInterface *)wifiInterface {
+    for (MPNetworkInterface *iface in [self availableInterfaces]) {
+        if (iface.type == MPNetworkTypeWiFi && iface.isUp && iface.ipv4Address) {
+            return iface;
+        }
+    }
+    return nil;
+}
+
++ (nullable MPNetworkInterface *)cellularInterface {
+    for (MPNetworkInterface *iface in [self availableInterfaces]) {
+        if (iface.type == MPNetworkTypeCellular && iface.isUp && iface.ipv4Address) {
+            return iface;
+        }
+    }
+    return nil;
+}
+
++ (nullable NSString *)interfaceNameForType:(MPNetworkType)type {
+    switch (type) {
+        case MPNetworkTypeWiFi:
+            return [self wifiInterface].name;
+        case MPNetworkTypeCellular:
+            return [self cellularInterface].name;
+        case MPNetworkTypeAny:
+            return nil;
+    }
+}
+
++ (nullable NSString *)ipAddressForType:(MPNetworkType)type {
+    switch (type) {
+        case MPNetworkTypeWiFi:
+            return [self wifiInterface].ipv4Address;
+        case MPNetworkTypeCellular:
+            return [self cellularInterface].ipv4Address;
+        case MPNetworkTypeAny:
+            return nil;
+    }
+}
+
+@end
+```
+
+##### 2. libcurl HTTP 客户端（核心实现）
+
+```objc
+// MPCurlHTTPClient.h
+
+#import <Foundation/Foundation.h>
+#import "CURLInterfaceHelper.h"
+
+@class MPCurlResponse;
+
+typedef void (^MPCurlCompletion)(MPCurlResponse * _Nullable response, NSError * _Nullable error);
+
+@interface MPCurlResponse : NSObject
+@property (nonatomic, assign) NSInteger statusCode;
+@property (nonatomic, copy) NSDictionary<NSString *, NSString *> *headers;
+@property (nonatomic, copy) NSData *body;
+@property (nonatomic, copy) NSString *usedInterface;  // 实际使用的网卡
+@property (nonatomic, assign) double totalTime;        // 总耗时（秒）
+@property (nonatomic, assign) double connectTime;      // 连接耗时
+@property (nonatomic, assign) double nameLookupTime;   // DNS 耗时
+@end
+
+@interface MPCurlHTTPClient : NSObject
+
+/// 指定网卡发起 GET 请求
+- (void)GET:(NSString *)url
+  interface:(MPNetworkType)networkType
+ completion:(MPCurlCompletion)completion;
+
+/// 指定网卡发起 POST 请求
+- (void)POST:(NSString *)url
+     headers:(nullable NSDictionary<NSString *, NSString *> *)headers
+        body:(nullable NSData *)body
+   interface:(MPNetworkType)networkType
+  completion:(MPCurlCompletion)completion;
+
+/// 带自动回退的请求：先走 WiFi，超时/失败后自动切蜂窝
+- (void)requestWithFallback:(NSString *)url
+                     method:(NSString *)method
+                    headers:(nullable NSDictionary<NSString *, NSString *> *)headers
+                       body:(nullable NSData *)body
+               wifiTimeout:(NSTimeInterval)wifiTimeout
+                 completion:(MPCurlCompletion)completion;
+
+@end
+```
+
+```objc
+// MPCurlHTTPClient.m
+
+#import "MPCurlHTTPClient.h"
+#include <curl/curl.h>
+
+#pragma mark - Write/Header Callbacks
+
+struct CurlWriteBuffer {
+    char *data;
+    size_t size;
+};
+
+static size_t curl_write_callback(void *contents, size_t size, size_t nmemb, void *userp) {
+    size_t totalSize = size * nmemb;
+    struct CurlWriteBuffer *buf = (struct CurlWriteBuffer *)userp;
+    
+    char *ptr = realloc(buf->data, buf->size + totalSize + 1);
+    if (!ptr) return 0;
+    
+    buf->data = ptr;
+    memcpy(&(buf->data[buf->size]), contents, totalSize);
+    buf->size += totalSize;
+    buf->data[buf->size] = 0;
+    
+    return totalSize;
+}
+
+static size_t curl_header_callback(char *buffer, size_t size, size_t nitems, void *userdata) {
+    size_t totalSize = size * nitems;
+    NSMutableDictionary *headers = (__bridge NSMutableDictionary *)userdata;
+    
+    NSString *line = [[NSString alloc] initWithBytes:buffer length:totalSize encoding:NSUTF8StringEncoding];
+    if (!line) return totalSize;
+    
+    NSRange colonRange = [line rangeOfString:@":"];
+    if (colonRange.location != NSNotFound) {
+        NSString *key = [[line substringToIndex:colonRange.location]
+                         stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        NSString *value = [[line substringFromIndex:colonRange.location + 1]
+                           stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (key.length > 0) {
+            headers[key] = value;
+        }
+    }
+    
+    return totalSize;
+}
+
+#pragma mark - MPCurlResponse
+
+@implementation MPCurlResponse
+@end
+
+#pragma mark - MPCurlHTTPClient
+
+@implementation MPCurlHTTPClient {
+    dispatch_queue_t _curlQueue;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _curlQueue = dispatch_queue_create("com.multipath.curl", DISPATCH_QUEUE_CONCURRENT);
+        curl_global_init(CURL_GLOBAL_DEFAULT);
+    }
+    return self;
+}
+
+- (void)dealloc {
+    curl_global_cleanup();
+}
+
+#pragma mark - Public API
+
+- (void)GET:(NSString *)url
+  interface:(MPNetworkType)networkType
+ completion:(MPCurlCompletion)completion {
+    [self performRequest:url
+                  method:@"GET"
+                 headers:nil
+                    body:nil
+               interface:networkType
+                 timeout:30
+              completion:completion];
+}
+
+- (void)POST:(NSString *)url
+     headers:(NSDictionary<NSString *, NSString *> *)headers
+        body:(NSData *)body
+   interface:(MPNetworkType)networkType
+  completion:(MPCurlCompletion)completion {
+    [self performRequest:url
+                  method:@"POST"
+                 headers:headers
+                    body:body
+               interface:networkType
+                 timeout:30
+              completion:completion];
+}
+
+- (void)requestWithFallback:(NSString *)url
+                     method:(NSString *)method
+                    headers:(NSDictionary<NSString *, NSString *> *)headers
+                       body:(NSData *)body
+               wifiTimeout:(NSTimeInterval)wifiTimeout
+                 completion:(MPCurlCompletion)completion {
+    
+    // 先尝试 WiFi
+    [self performRequest:url
+                  method:method
+                 headers:headers
+                    body:body
+               interface:MPNetworkTypeWiFi
+                 timeout:wifiTimeout
+              completion:^(MPCurlResponse *response, NSError *error) {
+        
+        if (error && [MPInterfaceDetector cellularInterface]) {
+            NSLog(@"[MultiPath] WiFi request failed (%@), falling back to cellular", error.localizedDescription);
+            
+            // WiFi 失败，回退到蜂窝
+            [self performRequest:url
+                          method:method
+                         headers:headers
+                            body:body
+                       interface:MPNetworkTypeCellular
+                         timeout:30
+                      completion:completion];
+        } else {
+            completion(response, error);
+        }
+    }];
+}
+
+#pragma mark - Core curl execution
+
+- (void)performRequest:(NSString *)url
+                method:(NSString *)method
+               headers:(NSDictionary<NSString *, NSString *> *)headers
+                  body:(NSData *)body
+             interface:(MPNetworkType)networkType
+               timeout:(NSTimeInterval)timeout
+            completion:(MPCurlCompletion)completion {
+    
+    dispatch_async(_curlQueue, ^{
+        CURL *curl = curl_easy_init();
+        if (!curl) {
+            NSError *err = [NSError errorWithDomain:@"MPCurl" code:-1 userInfo:@{
+                NSLocalizedDescriptionKey: @"curl_easy_init failed"
+            }];
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, err); });
+            return;
+        }
+        
+        // ---- URL ----
+        curl_easy_setopt(curl, CURLOPT_URL, [url UTF8String]);
+        
+        // ---- 指定网络接口（核心） ----
+        NSString *interfaceName = [MPInterfaceDetector interfaceNameForType:networkType];
+        NSString *interfaceIP = [MPInterfaceDetector ipAddressForType:networkType];
+        
+        if (interfaceName) {
+            // 方式 1：用接口名绑定（推荐）
+            NSString *ifSpec = [NSString stringWithFormat:@"if!%@", interfaceName];
+            curl_easy_setopt(curl, CURLOPT_INTERFACE, [ifSpec UTF8String]);
+            
+            NSLog(@"[MultiPath] Binding to interface: %@ (%@)", interfaceName, interfaceIP ?: @"no IP");
+        } else if (interfaceIP) {
+            // 方式 2：用 IP 地址绑定
+            NSString *hostSpec = [NSString stringWithFormat:@"host!%@", interfaceIP];
+            curl_easy_setopt(curl, CURLOPT_INTERFACE, [hostSpec UTF8String]);
+        }
+        // networkType == MPNetworkTypeAny 时不设置 CURLOPT_INTERFACE，由系统路由
+        
+        // ---- Method ----
+        if ([method isEqualToString:@"POST"]) {
+            curl_easy_setopt(curl, CURLOPT_POST, 1L);
+            if (body) {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.bytes);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.length);
+            }
+        } else if ([method isEqualToString:@"PUT"]) {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "PUT");
+            if (body) {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, body.bytes);
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)body.length);
+            }
+        } else if ([method isEqualToString:@"DELETE"]) {
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, "DELETE");
+        }
+        // GET is the default
+        
+        // ---- Headers ----
+        struct curl_slist *headerList = NULL;
+        for (NSString *key in headers) {
+            NSString *header = [NSString stringWithFormat:@"%@: %@", key, headers[key]];
+            headerList = curl_slist_append(headerList, [header UTF8String]);
+        }
+        if (headerList) {
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headerList);
+        }
+        
+        // ---- TLS (使用系统 CA 证书) ----
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        // iOS Secure Transport 后端会自动使用系统信任链
+        
+        // ---- 超时 ----
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, (long)timeout);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, (long)MIN(timeout, 10));
+        
+        // ---- Follow redirects ----
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 10L);
+        
+        // ---- Response body buffer ----
+        struct CurlWriteBuffer bodyBuf = { .data = malloc(1), .size = 0 };
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, &bodyBuf);
+        
+        // ---- Response headers ----
+        NSMutableDictionary *respHeaders = [NSMutableDictionary dictionary];
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, curl_header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, (__bridge void *)respHeaders);
+        
+        // ---- DNS 缓存（减少重复解析开销） ----
+        curl_easy_setopt(curl, CURLOPT_DNS_CACHE_TIMEOUT, 300L);
+        
+        // ---- Execute ----
+        CURLcode res = curl_easy_perform(curl);
+        
+        if (res != CURLE_OK) {
+            free(bodyBuf.data);
+            if (headerList) curl_slist_free_all(headerList);
+            
+            const char *errStr = curl_easy_strerror(res);
+            NSError *err = [NSError errorWithDomain:@"MPCurl" code:res userInfo:@{
+                NSLocalizedDescriptionKey: [NSString stringWithUTF8String:errStr],
+                @"CURLcode": @(res),
+                @"interface": interfaceName ?: @"default"
+            }];
+            
+            curl_easy_cleanup(curl);
+            dispatch_async(dispatch_get_main_queue(), ^{ completion(nil, err); });
+            return;
+        }
+        
+        // ---- Build response ----
+        MPCurlResponse *response = [[MPCurlResponse alloc] init];
+        
+        long httpCode = 0;
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &httpCode);
+        response.statusCode = httpCode;
+        
+        response.headers = [respHeaders copy];
+        response.body = [NSData dataWithBytes:bodyBuf.data length:bodyBuf.size];
+        response.usedInterface = interfaceName ?: @"default";
+        
+        double totalTime = 0, connectTime = 0, dnsTime = 0;
+        curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &totalTime);
+        curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &connectTime);
+        curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &dnsTime);
+        response.totalTime = totalTime;
+        response.connectTime = connectTime;
+        response.nameLookupTime = dnsTime;
+        
+        // ---- Cleanup ----
+        free(bodyBuf.data);
+        if (headerList) curl_slist_free_all(headerList);
+        curl_easy_cleanup(curl);
+        
+        dispatch_async(dispatch_get_main_queue(), ^{ completion(response, nil); });
+    });
+}
+
+@end
+```
+
+##### 3. 带智能回退的高层封装
+
+```objc
+// MPSmartHTTPClient.h — 智能多网卡 HTTP 客户端
+
+#import <Foundation/Foundation.h>
+#import "MPCurlHTTPClient.h"
+
+/// 请求策略
+typedef NS_ENUM(NSInteger, MPRequestStrategy) {
+    MPRequestStrategyWiFiOnly,          // 只走 WiFi
+    MPRequestStrategyCellularOnly,      // 只走蜂窝
+    MPRequestStrategyWiFiWithFallback,  // WiFi 优先，失败回退蜂窝
+    MPRequestStrategyFastestWins,       // WiFi 和蜂窝竞速，取先到者
+    MPRequestStrategyAuto,             // 根据当前网络质量自动选择
+};
+
+@interface MPSmartHTTPClient : NSObject
+
+@property (nonatomic, assign) NSTimeInterval wifiFallbackTimeout; // WiFi 超时阈值，默认 5s
+@property (nonatomic, assign) NSTimeInterval cellularTimeout;     // 蜂窝超时，默认 30s
+
+- (void)request:(NSString *)url
+         method:(NSString *)method
+        headers:(nullable NSDictionary<NSString *, NSString *> *)headers
+           body:(nullable NSData *)body
+       strategy:(MPRequestStrategy)strategy
+     completion:(MPCurlCompletion)completion;
+
+@end
+```
+
+```objc
+// MPSmartHTTPClient.m
+
+#import "MPSmartHTTPClient.h"
+
+@implementation MPSmartHTTPClient {
+    MPCurlHTTPClient *_curlClient;
+}
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _curlClient = [[MPCurlHTTPClient alloc] init];
+        _wifiFallbackTimeout = 5.0;
+        _cellularTimeout = 30.0;
+    }
+    return self;
+}
+
+- (void)request:(NSString *)url
+         method:(NSString *)method
+        headers:(NSDictionary<NSString *, NSString *> *)headers
+           body:(NSData *)body
+       strategy:(MPRequestStrategy)strategy
+     completion:(MPCurlCompletion)completion {
+    
+    switch (strategy) {
+        case MPRequestStrategyWiFiOnly:
+            [_curlClient performRequest:url method:method headers:headers body:body
+                              interface:MPNetworkTypeWiFi timeout:self.cellularTimeout
+                             completion:completion];
+            break;
+            
+        case MPRequestStrategyCellularOnly:
+            [_curlClient performRequest:url method:method headers:headers body:body
+                              interface:MPNetworkTypeCellular timeout:self.cellularTimeout
+                             completion:completion];
+            break;
+            
+        case MPRequestStrategyWiFiWithFallback:
+            [_curlClient requestWithFallback:url method:method headers:headers body:body
+                                wifiTimeout:self.wifiFallbackTimeout completion:completion];
+            break;
+            
+        case MPRequestStrategyFastestWins:
+            [self raceRequest:url method:method headers:headers body:body completion:completion];
+            break;
+            
+        case MPRequestStrategyAuto:
+            [self autoRequest:url method:method headers:headers body:body completion:completion];
+            break;
+    }
+}
+
+/// 竞速：同时走 WiFi 和蜂窝，取先返回者
+- (void)raceRequest:(NSString *)url
+             method:(NSString *)method
+            headers:(NSDictionary *)headers
+               body:(NSData *)body
+         completion:(MPCurlCompletion)completion {
+    
+    __block BOOL completed = NO;
+    __block NSLock *lock = [[NSLock alloc] init];
+    
+    void (^onceCompletion)(MPCurlResponse *, NSError *) = ^(MPCurlResponse *resp, NSError *err) {
+        [lock lock];
+        if (!completed) {
+            completed = YES;
+            [lock unlock];
+            completion(resp, err);
+        } else {
+            [lock unlock];
+        }
+    };
+    
+    // WiFi 路径
+    [_curlClient performRequest:url method:method headers:headers body:body
+                      interface:MPNetworkTypeWiFi timeout:self.wifiFallbackTimeout
+                     completion:^(MPCurlResponse *resp, NSError *err) {
+        if (!err) {
+            onceCompletion(resp, nil);
+        }
+    }];
+    
+    // 蜂窝路径（延迟 200ms 启动，给 WiFi 先机）
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.2 * NSEC_PER_SEC)),
+                   dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+        [self->_curlClient performRequest:url method:method headers:headers body:body
+                          interface:MPNetworkTypeCellular timeout:self.cellularTimeout
+                         completion:^(MPCurlResponse *resp, NSError *err) {
+            onceCompletion(resp, err);
+        }];
+    });
+    
+    // 兜底超时
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(self.cellularTimeout * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSError *err = [NSError errorWithDomain:@"MPCurl" code:-2 userInfo:@{
+            NSLocalizedDescriptionKey: @"Both WiFi and cellular timed out"
+        }];
+        onceCompletion(nil, err);
+    });
+}
+
+/// 自动策略：检测网络状态后选择最优路径
+- (void)autoRequest:(NSString *)url
+             method:(NSString *)method
+            headers:(NSDictionary *)headers
+               body:(NSData *)body
+         completion:(MPCurlCompletion)completion {
+    
+    MPNetworkInterface *wifi = [MPInterfaceDetector wifiInterface];
+    MPNetworkInterface *cell = [MPInterfaceDetector cellularInterface];
+    
+    if (wifi && cell) {
+        // 两个都可用 → WiFi 优先 + 回退
+        [_curlClient requestWithFallback:url method:method headers:headers body:body
+                            wifiTimeout:self.wifiFallbackTimeout completion:completion];
+    } else if (wifi) {
+        // 只有 WiFi
+        [_curlClient performRequest:url method:method headers:headers body:body
+                          interface:MPNetworkTypeWiFi timeout:self.cellularTimeout
+                         completion:completion];
+    } else if (cell) {
+        // 只有蜂窝
+        [_curlClient performRequest:url method:method headers:headers body:body
+                          interface:MPNetworkTypeCellular timeout:self.cellularTimeout
+                         completion:completion];
+    } else {
+        // 无网络
+        NSError *err = [NSError errorWithDomain:@"MPCurl" code:-3 userInfo:@{
+            NSLocalizedDescriptionKey: @"No network interface available"
+        }];
+        completion(nil, err);
+    }
+}
+
+@end
+```
+
+##### 4. Swift 封装层（可选）
+
+```swift
+// MultiPathCurl.swift — Swift 友好的封装
+
+import Foundation
+
+enum NetworkInterface {
+    case wifi
+    case cellular
+    case any
+    
+    var mpType: MPNetworkType {
+        switch self {
+        case .wifi:     return .wifi
+        case .cellular: return .cellular
+        case .any:      return .any
+        }
+    }
+}
+
+enum RequestStrategy {
+    case wifiOnly
+    case cellularOnly
+    case wifiWithFallback(timeout: TimeInterval)
+    case race
+    case auto
+}
+
+class MultiPathCurl {
+    
+    static let shared = MultiPathCurl()
+    
+    private let client = MPSmartHTTPClient()
+    
+    /// 获取当前可用网络接口信息
+    var availableInterfaces: [String: String] {
+        var result: [String: String] = [:]
+        if let wifi = MPInterfaceDetector.wifiInterface() {
+            result["wifi"] = "\(wifi.name ?? "en0") (\(wifi.ipv4Address ?? ""))"
+        }
+        if let cell = MPInterfaceDetector.cellularInterface() {
+            result["cellular"] = "\(cell.name ?? "pdp_ip0") (\(cell.ipv4Address ?? ""))"
+        }
+        return result
+    }
+    
+    /// 指定网卡发起 GET
+    func get(_ url: String,
+             via interface: NetworkInterface = .any,
+             completion: @escaping (Data?, Int, Error?) -> Void) {
+        
+        client.request(url, method: "GET", headers: nil, body: nil,
+                       strategy: .wiFiWithFallback) { response, error in
+            completion(response?.body, Int(response?.statusCode ?? 0), error)
+        }
+    }
+    
+    /// 带策略的请求
+    func request(_ url: String,
+                 method: String = "GET",
+                 headers: [String: String]? = nil,
+                 body: Data? = nil,
+                 strategy: RequestStrategy = .auto,
+                 completion: @escaping (MPCurlResponse?, Error?) -> Void) {
+        
+        let mpStrategy: MPRequestStrategy
+        switch strategy {
+        case .wifiOnly:
+            mpStrategy = .wiFiOnly
+        case .cellularOnly:
+            mpStrategy = .cellularOnly
+        case .wifiWithFallback(let timeout):
+            client.wifiFallbackTimeout = timeout
+            mpStrategy = .wiFiWithFallback
+        case .race:
+            mpStrategy = .fastestWins
+        case .auto:
+            mpStrategy = .auto
+        }
+        
+        client.request(url, method: method, headers: headers, body: body,
+                       strategy: mpStrategy, completion: completion)
+    }
+}
+```
+
+##### 5. 使用示例
+
+```objc
+// Objective-C 使用示例
+
+MPCurlHTTPClient *client = [[MPCurlHTTPClient alloc] init];
+
+// 示例 1：强制走蜂窝网络
+[client GET:@"https://api.example.com/data"
+  interface:MPNetworkTypeCellular
+ completion:^(MPCurlResponse *response, NSError *error) {
+    if (error) {
+        NSLog(@"蜂窝请求失败: %@", error);
+        return;
+    }
+    NSLog(@"状态码: %ld, 使用网卡: %@, 耗时: %.3fs",
+          (long)response.statusCode, response.usedInterface, response.totalTime);
+}];
+
+// 示例 2：强制走 WiFi
+[client GET:@"https://api.example.com/data"
+  interface:MPNetworkTypeWiFi
+ completion:^(MPCurlResponse *response, NSError *error) {
+    // ...
+}];
+
+// 示例 3：WiFi 优先，5 秒超时后自动切蜂窝
+[client requestWithFallback:@"https://api.example.com/data"
+                     method:@"GET"
+                    headers:nil
+                       body:nil
+               wifiTimeout:5.0
+                 completion:^(MPCurlResponse *response, NSError *error) {
+    NSLog(@"最终使用网卡: %@", response.usedInterface);
+}];
+
+// 示例 4：查看当前可用接口
+NSArray *interfaces = [MPInterfaceDetector availableInterfaces];
+for (MPNetworkInterface *iface in interfaces) {
+    NSLog(@"接口: %@, IP: %@, 类型: %ld, 状态: %@",
+          iface.name, iface.ipv4Address, (long)iface.type,
+          iface.isUp ? @"UP" : @"DOWN");
+}
+```
+
+```swift
+// Swift 使用示例
+
+let curl = MultiPathCurl.shared
+
+// 查看可用接口
+print("可用网络: \(curl.availableInterfaces)")
+
+// WiFi 优先 + 3 秒超时回退蜂窝
+curl.request("https://api.example.com/data",
+             strategy: .wifiWithFallback(timeout: 3)) { response, error in
+    guard let resp = response else {
+        print("请求失败: \(error?.localizedDescription ?? "")")
+        return
+    }
+    print("HTTP \(resp.statusCode) via \(resp.usedInterface), \(resp.totalTime)s")
+}
+
+// 竞速模式
+curl.request("https://api.example.com/critical-data",
+             strategy: .race) { response, error in
+    // 哪个网卡先返回就用哪个
+}
+```
+
+#### CURLOPT_INTERFACE 在 iOS 上的重要注意事项
+
+##### 已知限制：蜂窝唤醒问题
+
+**POSIX socket 绑定（libcurl 底层使用的方式）不会主动唤醒 iOS 蜂窝无线电硬件**。这意味着：
+
+| 场景 | CURLOPT_INTERFACE 表现 |
+|------|----------------------|
+| WiFi + 蜂窝同时在线（最常见） | ✅ 正常工作 |
+| 只有蜂窝（无 WiFi） | ✅ 正常工作 |
+| WiFi 在线，蜂窝休眠 | ⚠️ 可能失败（蜂窝未唤醒） |
+| 蜂窝被系统节能关闭 | ❌ 失败 |
+
+##### 解决蜂窝唤醒问题的方案
+
+```objc
+// 方案 1（推荐）：先用 NWConnection 唤醒蜂窝，再用 curl 请求
+
+#import <Network/Network.h>
+
+- (void)ensureCellularActiveWithCompletion:(void (^)(BOOL success))completion {
+    NWParameters *params = [NWParameters new];
+    params.requiredInterfaceType = NWInterfaceTypeCellular;
+    params.prohibitExpensivePaths = NO;
+    
+    nw_connection_t conn = nw_connection_create(
+        nw_endpoint_create_host("connectivity-check.ubuntu.com", "80"),
+        nw_parameters_create_secure_tcp(
+            NW_PARAMETERS_DISABLE_PROTOCOL,
+            NW_PARAMETERS_DEFAULT_CONFIGURATION
+        )
+    );
+    
+    // 简化：用 Swift 写更清晰（见下方 Swift 版）
+}
+
+// Swift 版本
+func ensureCellularActive() async -> Bool {
+    let params = NWParameters.tcp
+    params.requiredInterfaceType = .cellular
+    params.prohibitExpensivePaths = false
+    
+    let connection = NWConnection(
+        host: "connectivity-check.ubuntu.com",
+        port: 80,
+        using: params
+    )
+    
+    return await withCheckedContinuation { continuation in
+        connection.stateUpdateHandler = { state in
+            switch state {
+            case .ready:
+                connection.cancel()
+                continuation.resume(returning: true)
+            case .failed, .cancelled:
+                continuation.resume(returning: false)
+            default:
+                break
+            }
+        }
+        connection.start(queue: .global())
+        
+        // 超时保护
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            connection.cancel()
+        }
+    }
+}
+
+// 使用：先唤醒蜂窝，再走 curl
+func requestViaCellularWithWakeup(url: String) async {
+    let woken = await ensureCellularActive()
+    if woken {
+        MultiPathCurl.shared.request(url, strategy: .cellularOnly) { resp, err in
+            // 蜂窝已激活，curl 绑定 pdp_ip0 可正常工作
+        }
+    }
+}
+```
+
+```objc
+// 方案 2：用 CURLOPT_INTERFACE 绑定 IP 而非接口名
+// 有时绑定 IP 比绑定接口名更可靠
+
+NSString *cellularIP = [MPInterfaceDetector ipAddressForType:MPNetworkTypeCellular];
+if (cellularIP) {
+    NSString *hostSpec = [NSString stringWithFormat:@"host!%@", cellularIP];
+    curl_easy_setopt(curl, CURLOPT_INTERFACE, [hostSpec UTF8String]);
+}
+```
+
+#### libcurl vs NWConnection 对比
+
+| 特性 | libcurl + CURLOPT_INTERFACE | NWConnection + requiredInterfaceType |
+|------|---------------------------|-------------------------------------|
+| HTTP 协议支持 | ✅ 完整（HTTP/1.1, HTTP/2, HTTP/3） | ❌ 需手动拼装 |
+| TLS 支持 | ✅ 内置（Secure Transport / OpenSSL） | ✅ 内置 |
+| Cookie 管理 | ✅ 内置 | ❌ 需手动 |
+| 重定向跟随 | ✅ 内置 | ❌ 需手动 |
+| 代理支持 | ✅ 内置 | ❌ 需手动 |
+| 蜂窝唤醒 | ⚠️ 不保证 | ✅ 系统级保证 |
+| 跨平台 | ✅ C 库，全平台可用 | ❌ Apple only |
+| 包体积 | +1~3MB（静态链接） | 0（系统框架） |
+| API 稳定性 | ✅ 非常稳定 | ✅ 稳定 |
+| 接口选择粒度 | 接口名或 IP | 接口类型（wifi/cellular） |
+
+#### 优点
+
+- **完整的 HTTP 客户端**：不需要手动拼 HTTP 报文，支持 HTTP/1.1、HTTP/2、HTTP/3
+- **成熟稳定**：libcurl 有 25+ 年历史，生产级可靠性
+- **精确到接口名**：可以指定 `en0`、`pdp_ip0` 这样的具体接口名
+- **跨平台**：同一套 curl 代码可在 iOS、Android (NDK)、Linux、macOS 上运行
+- **丰富的调试信息**：`CURLINFO_*` 提供 DNS 时间、连接时间、TLS 握手时间等
+- **Cookie 和重定向**：内置支持，无需手写
+
+#### 缺点
+
+- **需要额外集成 libcurl**：增加 ~1-3MB 包体积
+- **蜂窝唤醒问题**：POSIX socket bind 不会唤醒 iOS 蜂窝硬件，需配合 NWConnection 预热
+- **接口名不是官方 API**：Apple 不保证 `en0`/`pdp_ip0` 永远不变（实际一直稳定）
+- **C API**：需要 Objective-C 或 Swift 桥接封装
+- **不支持后台传输**：URLSession 的后台传输能力 curl 不具备
+
+---
+
 ## 四、方案选型建议
 
 ### 决策树
@@ -636,19 +1606,37 @@ func createQUICConnection(host: String, port: UInt16) -> NWConnection? {
 │   │   ├── 是 → 方案 A（MPTCP），最简单
 │   │   └── 否，但能支持 HTTP/3？
 │   │       ├── 是 → 方案 E（QUIC 连接迁移）
-│   │       └── 否 → 方案 C（NWPathMonitor + 回退）
+│   │       └── 否 → 往下看
 │   └──
-└── 否（不能改服务端）
-    ├── 只需要 HTTP 请求？
-    │   ├── 是 → 方案 C（NWPathMonitor + 回退）
-    │   └── 否（自定义协议）→ 方案 B（NWConnection 直接指定接口）
+└── 否（不能改服务端）或服务端无法改造
+    ├── 需要完整的 HTTP 能力（Cookie、重定向、HTTP/2）？
+    │   ├── 是 → 方案 F（libcurl + CURLOPT_INTERFACE）⭐
+    │   └── 否（只需简单请求）→ 方案 B（NWConnection）
+    ├── 已有 libcurl / 跨平台 C++ 网络层？
+    │   └── 是 → 方案 F（libcurl），可复用现有代码
+    ├── 纯 Swift/ObjC 项目，不想引入 C 依赖？
+    │   └── 是 → 方案 C（NWPathMonitor + URLSession 回退）
     └── 对延迟极度敏感？
-        └── 是 → 方案 D（竞速连接）
+        └── 是 → 方案 D（竞速连接）或方案 F 的竞速模式
 ```
 
-### 推荐方案：方案 C（NWPathMonitor + URLSession 回退）
+### 推荐方案
 
-对于大多数 iOS 项目，**方案 C** 是最务实的选择：
+#### 首选：方案 F（libcurl + CURLOPT_INTERFACE）
+
+如果项目可以接入 libcurl（约 1-3MB 包体积增加），**方案 F 是最完整的选择**：
+
+1. **完整 HTTP 客户端**：不需要手动拼 HTTP 报文，Cookie、重定向、HTTP/2 全部内置
+2. **精确到接口名**：`CURLOPT_INTERFACE` 直接指定 `en0`（WiFi）或 `pdp_ip0`（蜂窝）
+3. **不需要服务端改造**
+4. **跨平台**：同一套代码可移植到 Android NDK
+5. **丰富的性能指标**：DNS 时间、TCP 连接时间、TLS 握手时间等
+
+> **注意**：需配合 `NWConnection` 解决蜂窝唤醒问题（详见方案 F 代码）
+
+#### 备选：方案 C（NWPathMonitor + URLSession 回退）
+
+如果不想引入 libcurl 依赖，**方案 C** 是纯 Apple API 的最佳选择：
 
 1. **不需要服务端改造**
 2. **主路径保持 URLSession 全部能力**（Cookie、缓存、重定向、证书验证、后台传输）
